@@ -322,7 +322,17 @@ class ParallelAttention(MegatronModule):
             )
 
         # Strided linear layer.
-        if attention_type == AttnType.self_attn:
+        if attention_type == AttnType.self_attn and self.onnx_safe:
+            self.query = ColumnLinear(
+                hidden_size, projection_size, gather_output=False, init_method=init_method, bias=bias
+            )
+            self.key = ColumnLinear(
+                hidden_size, projection_size, gather_output=False, init_method=init_method, bias=bias
+            )
+            self.value = ColumnLinear(
+                hidden_size, projection_size, gather_output=False, init_method=init_method, bias=bias
+            )
+        elif attention_type == AttnType.self_attn and not self.onnx_safe:
             self.query_key_value = ColumnLinear(
                 hidden_size,
                 3 * projection_size,
@@ -330,6 +340,17 @@ class ParallelAttention(MegatronModule):
                 init_method=init_method,
                 use_cpu_initialization=use_cpu_initialization,
                 bias=bias,
+            )
+        elif self.onnx_safe:
+            assert attention_type == AttnType.cross_attn
+            self.query = ColumnLinear(
+                hidden_size, projection_size, gather_output=False, init_method=init_method, bias=bias
+            )
+            self.key = ColumnLinear(
+                hidden_size, projection_size, gather_output=False, init_method=init_method, bias=bias
+            )
+            self.value = ColumnLinear(
+                hidden_size, projection_size, gather_output=False, init_method=init_method, bias=bias
             )
         else:
             assert attention_type == AttnType.cross_attn
@@ -547,8 +568,21 @@ class ParallelAttention(MegatronModule):
         # =====================
         # Query, Key, and Value
         # =====================
+        def _split_heads(tensor, attn_head_size):
+            new_shape = tensor.size()[:-1] + (-1, attn_head_size)
+            tensor = tensor.view(new_shape)
+            return tensor
 
-        if self.attention_type == AttnType.self_attn:
+        if self.attention_type == AttnType.self_attn and self.onnx_safe:
+            query_layer, _ = self.query(hidden_states)
+            query_layer = _split_heads(query_layer, self.hidden_size_per_attention_head)
+
+            key_layer, _ = self.key(hidden_states)
+            key_layer = _split_heads(key_layer, self.hidden_size_per_attention_head)
+
+            value_layer, _ = self.value(hidden_states)
+            value_layer = _split_heads(value_layer, self.hidden_size_per_attention_head)
+        elif self.attention_type == AttnType.self_attn and not self.onnx_safe:
             # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
             mixed_x_layer, _ = self.query_key_value(hidden_states)
 
@@ -563,6 +597,15 @@ class ParallelAttention(MegatronModule):
 
             # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
             (query_layer, key_layer, value_layer) = tensor_parallel.split_tensor_along_last_dim(mixed_x_layer, 3)
+        elif self.onnx_safe:
+            query_layer, _ = self.query(hidden_states)
+            query_layer = _split_heads(query_layer, self.hidden_size_per_attention_head)
+
+            key_layer, _ = self.key(hidden_states)
+            key_layer = _split_heads(key_layer, self.hidden_size_per_attention_head)
+
+            value_layer, _ = self.value(hidden_states)
+            value_layer = _split_heads(value_layer, self.hidden_size_per_attention_head)
         else:
             # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
             mixed_kv_layer, _ = self.key_value(encoder_output)

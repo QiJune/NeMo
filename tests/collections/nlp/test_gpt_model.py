@@ -71,10 +71,9 @@ def model_cfg(test_data_dir):
         'megatron_amp_O2': False,
         'seed': 1234,
         'use_cpu_initialization': False,
-        'onnx_safe': True,
+        'onnx_safe': False,
         'apex_transformer_log_level': 30,
         'activations_checkpoint_method': None,
-        'bias_activation_fusion': False,
         'activations_checkpoint_num_layers': 1,
         'data': {
             'data_prefix': '???',
@@ -156,6 +155,7 @@ def test_text():
     return test_text
 
 
+@pytest.mark.run_only_on('GPU')
 class TestGPTModel:
     @pytest.mark.unit
     def test_constructor(self, gpt_model):
@@ -225,46 +225,13 @@ class TestGPTModel:
                 attn_mask, _, pos_ids = attn_mask_and_pos_ids
                 assert tokens.shape == pos_ids.shape
                 assert attn_mask.shape[2] == attn_mask.shape[3] == tokens.shape[1] == pos_ids.shape[1]
-                with torch.autocast(device_type='cuda', dtype=dtype):
+                with torch.autocast('cuda', dtype=dtype):
                     output_tensor = gpt_model.forward(
                         tokens=tokens.cuda(),
                         text_position_ids=pos_ids.cuda(),
                         attention_mask=attn_mask.cuda(),
                         labels=None,
                     )
-
-                    dynamic_axes = {
-                        'input_ids': {
-                            0: 'batch_size',
-                            1: 'seq_len'
-                        },
-                        'position_ids': {
-                            0: 'batch_size',
-                            1: 'seq_len'
-                        },
-                        'attention_mask': {
-                            0: 'batch_size',
-                            2: 'seq_len',
-                            3: 'seq_len',
-                        },
-                        'logits': {
-                            0: 'batch_size',
-                            1: 'seq_len'
-                        }
-                    }
-
-                    input_names = ['input_ids', 'position_ids', 'attention_mask']
-                    output_names = ['logits']
-
-                    torch.onnx.export(gpt_model,
-                                      args=(tokens.cuda(), pos_ids.cuda(), attn_mask.cuda(), None),
-                                      f='gpt.onnx',
-                                      input_names=input_names,
-                                      output_names=output_names,
-                                      dynamic_axes=dynamic_axes,
-                                      opset_version=14,
-                                      do_constant_folding=True)
-
                 assert output_tensor.shape[1] == tokens.shape[1]
                 assert output_tensor.shape[2] == gpt_model.padded_vocab_size
                 assert output_tensor.dtype == dtype
