@@ -212,7 +212,7 @@ class ParallelMLP(MegatronModule):
         if transformer_block_type == 'normformer':
             if normalization == 'layernorm':
                 self.normalization = get_layer_norm(
-                    ffn_hidden_size // get_tensor_model_parallel_world_size(), layernorm_epsilon, persist_layer_norm
+                    ffn_hidden_size // get_tensor_model_parallel_world_size(), layernorm_epsilon, persist_layer_norm, onnx_safe
                 )
             else:
                 self.normalization = MixedFusedRMSNorm(
@@ -287,6 +287,7 @@ class ParallelAttention(MegatronModule):
         megatron_legacy=False,
         bias=True,
         headscale=False,
+        onnx_safe=False,
     ):
         super(ParallelAttention, self).__init__()
 
@@ -299,6 +300,7 @@ class ParallelAttention(MegatronModule):
         self.attn_mask_type = attn_mask_type
         self.megatron_legacy = megatron_legacy
         self.headscale = headscale
+        self.onnx_safe = onnx_safe
 
         if kv_channels is None:
             assert (
@@ -647,8 +649,22 @@ class ParallelAttention(MegatronModule):
         # [sk, b, np, hn] -> [sk, b * np, hn]
         key_layer = key_layer.view(output_size[3], output_size[0] * output_size[1], -1)
 
-        # [b * np, sq, hn] * [b * np, hn, sk] -> [b * np, sq, sk]
-        matmul_result = torch.matmul(query_layer.transpose(0, 1), key_layer.permute(1, 2, 0)) / self.norm_factor
+        matmul_result = torch.empty(
+            output_size[0] * output_size[1],
+            output_size[2],
+            output_size[3],
+            dtype=query_layer.dtype,
+            device=torch.cuda.current_device(),
+        )
+
+        # Raw attention scores. [b * np, sq, sk]
+        matmul_result = torch.baddbmm(
+            matmul_result,
+            query_layer.transpose(0, 1),  # [b * np, sq, hn]
+            key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
+            beta=0.0,
+            alpha=(1.0 / self.norm_factor),
+        )
 
         # change view to [b, np, sq, sk]
         attention_scores = matmul_result.view(*output_size)
@@ -775,6 +791,7 @@ class ParallelChunkedCrossAttention(MegatronModule):
         megatron_legacy=False,
         chunk_size=64,  # each chunk, how many tokens
         bias=True,
+        onnx_safe=False,
     ):
         super(ParallelChunkedCrossAttention, self).__init__()
         self.cross_attention = ParallelAttention(
@@ -796,6 +813,7 @@ class ParallelChunkedCrossAttention(MegatronModule):
             relative_attention_max_distance=relative_attention_max_distance,
             megatron_legacy=megatron_legacy,
             bias=bias,
+            onnx_safe=onnx_safe,
         )
         self.chunk_size = chunk_size
 
@@ -974,6 +992,7 @@ class ParallelTransformerLayer_(MegatronModule):
         self.bias = bias
         self.transformer_block_type = transformer_block_type
         self.position_embedding_type = position_embedding_type
+        self.onnx_safe = onnx_safe
 
         if not bias and bias_dropout_fusion:
             raise ValueError(
@@ -998,7 +1017,7 @@ class ParallelTransformerLayer_(MegatronModule):
         if self.layer_type != LayerType.retrieval_decoder_after_self_attn:
             # Layernorm on the input data.
             if normalization == 'layernorm':
-                self.input_layernorm = get_layer_norm(hidden_size, layernorm_epsilon, persist_layer_norm)
+                self.input_layernorm = get_layer_norm(hidden_size, layernorm_epsilon, persist_layer_norm, onnx_safe)
             else:
                 self.input_layernorm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon)
 
@@ -1023,19 +1042,18 @@ class ParallelTransformerLayer_(MegatronModule):
                 megatron_legacy=megatron_legacy,
                 bias=bias,
                 headscale=headscale,
+                onnx_safe=onnx_safe
             )
             # Normformer normalization
             if transformer_block_type == 'normformer':
                 if normalization == 'layernorm':
-                    self.post_attention_normformer_norm = get_layer_norm(
-                        hidden_size, layernorm_epsilon, persist_layer_norm
-                    )
+                    self.post_attention_normformer_norm = get_layer_norm(hidden_size, layernorm_epsilon, persist_layer_norm, onnx_safe)
                 else:
                     self.post_attention_normformer_norm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon)
 
             # Layernorm on the attention output
             if normalization == 'layernorm':
-                self.post_attention_layernorm = get_layer_norm(hidden_size, layernorm_epsilon, persist_layer_norm)
+                self.post_attention_layernorm = get_layer_norm(hidden_size, layernorm_epsilon, persist_layer_norm, onnx_safe)
             else:
                 self.post_attention_layernorm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon)
 
@@ -1064,12 +1082,13 @@ class ParallelTransformerLayer_(MegatronModule):
                 megatron_legacy=megatron_legacy,
                 bias=bias,
                 headscale=headscale,
+                onnx_safe=onnx_safe
             )
             # Normformer normalization
             if transformer_block_type == 'normformer':
                 if normalization == 'layernorm':
                     self.post_inter_attention_normformer_norm = get_layer_norm(
-                        hidden_size, layernorm_epsilon, persist_layer_norm
+                        hidden_size, layernorm_epsilon, persist_layer_norm, onnx_safe
                     )
                 else:
                     self.post_inter_attention_normformer_norm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon)
@@ -1077,7 +1096,7 @@ class ParallelTransformerLayer_(MegatronModule):
             # Layernorm on the attention output.
             if normalization == 'layernorm':
                 self.post_inter_attention_layernorm = get_layer_norm(
-                    hidden_size, layernorm_epsilon, persist_layer_norm
+                    hidden_size, layernorm_epsilon, persist_layer_norm, onnx_safe
                 )
             else:
                 self.post_inter_attention_layernorm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon)
@@ -1103,19 +1122,20 @@ class ParallelTransformerLayer_(MegatronModule):
                 megatron_legacy=megatron_legacy,
                 chunk_size=chunk_size,
                 bias=bias,
+                onnx_safe=onnx_safe
             )
             # Normformer normalization
             if transformer_block_type == 'normformer':
                 if normalization == 'layernorm':
                     self.post_inter_attention_normformer_norm = get_layer_norm(
-                        hidden_size, layernorm_epsilon, persist_layer_norm
+                        hidden_size, layernorm_epsilon, persist_layer_norm, onnx_safe
                     )
                 else:
                     self.post_inter_attention_normformer_norm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon)
             # Layernorm on the attention output.
             if normalization == 'layernorm':
                 self.post_inter_attention_layernorm = get_layer_norm(
-                    hidden_size, layernorm_epsilon, persist_layer_norm
+                    hidden_size, layernorm_epsilon, persist_layer_norm, onnx_safe
                 )
             else:
                 self.post_inter_attention_layernorm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon)
@@ -1539,7 +1559,7 @@ class ParallelTransformer(MegatronModule):
         if self.post_process:
             # Final layer norm before output.
             if normalization == 'layernorm':
-                self.final_layernorm = get_layer_norm(hidden_size, layernorm_epsilon, persist_layer_norm)
+                self.final_layernorm = get_layer_norm(hidden_size, layernorm_epsilon, persist_layer_norm, onnx_safe)
             else:
                 self.final_layernorm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon)
 

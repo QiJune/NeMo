@@ -142,6 +142,7 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
             layernorm_epsilon=self.cfg.get('layernorm_epsilon', 1e-5),
             onnx_safe=self.cfg.get('onnx_safe', False),
             persist_layer_norm=self.cfg.get('persist_layer_norm', False),
+            bias_gelu_fusion=self.cfg.get('bias_activation_fusion', False),
         )
 
         return model

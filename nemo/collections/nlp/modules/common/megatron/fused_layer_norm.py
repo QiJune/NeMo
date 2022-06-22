@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import torch
 
 try:
     from apex.contrib.layer_norm.layer_norm import FastLayerNorm
@@ -22,8 +23,9 @@ try:
 except (ImportError, ModuleNotFoundError):
     HAVE_APEX = False
 
-
-def get_layer_norm(hidden_size, eps=1e-5, persist_layer_norm=False):
+def get_layer_norm(hidden_size, eps=1e-5, persist_layer_norm=False, onnx_safe=False):
+    if onnx_safe:
+        return torch.nn.LayerNorm(hidden_size, eps)
     # List of hiddens sizes supported in the persistent layer norm kernel
     # If the hidden size is not supported, fall back to the non-persistent
     # kernel.

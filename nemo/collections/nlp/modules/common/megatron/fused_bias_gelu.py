@@ -67,3 +67,4 @@ def fused_bias_gelu(input, bias):
     args = _cast_if_autocast_enabled(input, bias)
     with torch.cuda.amp.autocast(enabled=False):
         return GeLUFunction.apply(*args)
+
