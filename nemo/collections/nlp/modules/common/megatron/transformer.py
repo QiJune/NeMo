@@ -728,17 +728,17 @@ class ParallelAttention(MegatronModule):
         if position_bias is None:
             if self.position_embedding_type == 'relative':
                 position_bias = self.compute_bias(real_seq_length, key_length)
+
+                # if key and values are already calculated
+                # we want only the last query position bias
+                if layer_past is not None:
+                    position_bias = position_bias[:, :, -hidden_states.size(0) :, :]
+
+                position_bias = position_bias + attention_mask
+                attention_scores += position_bias
             else:
                 pass  # HuggingFace implementation initialize position_bias to zero when not using
 
-            # if key and values are already calculated
-            # we want only the last query position bias
-            if layer_past is not None:
-                position_bias = position_bias[:, :, -hidden_states.size(0) :, :]
-
-            if self.position_embedding_type == 'relative':
-                position_bias = position_bias + attention_mask
-                attention_scores += position_bias
 
         # ===========================
         # Attention probs and dropout
