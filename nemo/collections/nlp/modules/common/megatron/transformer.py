@@ -212,7 +212,7 @@ class ParallelMLP(MegatronModule):
         if transformer_block_type == 'normformer':
             if normalization == 'layernorm':
                 self.normalization = get_layer_norm(
-                    ffn_hidden_size // get_tensor_model_parallel_world_size(), layernorm_epsilon, persist_layer_norm
+                    ffn_hidden_size // get_tensor_model_parallel_world_size(), layernorm_epsilon, persist_layer_norm, onnx_safe
                 )
             else:
                 self.normalization = MixedFusedRMSNorm(
@@ -287,6 +287,7 @@ class ParallelAttention(MegatronModule):
         megatron_legacy=False,
         bias=True,
         headscale=False,
+        onnx_safe=False,
     ):
         super(ParallelAttention, self).__init__()
 
@@ -299,6 +300,7 @@ class ParallelAttention(MegatronModule):
         self.attn_mask_type = attn_mask_type
         self.megatron_legacy = megatron_legacy
         self.headscale = headscale
+        self.onnx_safe = onnx_safe
 
         if kv_channels is None:
             assert (
@@ -320,7 +322,17 @@ class ParallelAttention(MegatronModule):
             )
 
         # Strided linear layer.
-        if attention_type == AttnType.self_attn:
+        if attention_type == AttnType.self_attn and self.onnx_safe:
+            self.query = ColumnLinear(
+                hidden_size, projection_size, gather_output=False, init_method=init_method, bias=bias
+            )
+            self.key = ColumnLinear(
+                hidden_size, projection_size, gather_output=False, init_method=init_method, bias=bias
+            )
+            self.value = ColumnLinear(
+                hidden_size, projection_size, gather_output=False, init_method=init_method, bias=bias
+            )
+        elif attention_type == AttnType.self_attn and not self.onnx_safe:
             self.query_key_value = ColumnLinear(
                 hidden_size,
                 3 * projection_size,
@@ -328,6 +340,17 @@ class ParallelAttention(MegatronModule):
                 init_method=init_method,
                 use_cpu_initialization=use_cpu_initialization,
                 bias=bias,
+            )
+        elif self.onnx_safe:
+            assert attention_type == AttnType.cross_attn
+            self.query = ColumnLinear(
+                hidden_size, projection_size, gather_output=False, init_method=init_method, bias=bias
+            )
+            self.key = ColumnLinear(
+                hidden_size, projection_size, gather_output=False, init_method=init_method, bias=bias
+            )
+            self.value = ColumnLinear(
+                hidden_size, projection_size, gather_output=False, init_method=init_method, bias=bias
             )
         else:
             assert attention_type == AttnType.cross_attn
@@ -545,8 +568,21 @@ class ParallelAttention(MegatronModule):
         # =====================
         # Query, Key, and Value
         # =====================
+        def _split_heads(tensor, attn_head_size):
+            new_shape = tensor.size()[:-1] + (-1, attn_head_size)
+            tensor = tensor.view(new_shape)
+            return tensor
 
-        if self.attention_type == AttnType.self_attn:
+        if self.attention_type == AttnType.self_attn and self.onnx_safe:
+            query_layer, _ = self.query(hidden_states)
+            query_layer = _split_heads(query_layer, self.hidden_size_per_attention_head)
+
+            key_layer, _ = self.key(hidden_states)
+            key_layer = _split_heads(key_layer, self.hidden_size_per_attention_head)
+
+            value_layer, _ = self.value(hidden_states)
+            value_layer = _split_heads(value_layer, self.hidden_size_per_attention_head)
+        elif self.attention_type == AttnType.self_attn and not self.onnx_safe:
             # Attention heads [sq, b, h] --> [sq, b, (np * 3 * hn)]
             mixed_x_layer, _ = self.query_key_value(hidden_states)
 
@@ -561,6 +597,15 @@ class ParallelAttention(MegatronModule):
 
             # [sq, b, np, 3 * hn] --> 3 [sq, b, np, hn]
             (query_layer, key_layer, value_layer) = tensor_parallel.split_tensor_along_last_dim(mixed_x_layer, 3)
+        elif self.onnx_safe:
+            query_layer, _ = self.query(hidden_states)
+            query_layer = _split_heads(query_layer, self.hidden_size_per_attention_head)
+
+            key_layer, _ = self.key(hidden_states)
+            key_layer = _split_heads(key_layer, self.hidden_size_per_attention_head)
+
+            value_layer, _ = self.value(hidden_states)
+            value_layer = _split_heads(value_layer, self.hidden_size_per_attention_head)
         else:
             # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
             mixed_kv_layer, _ = self.key_value(encoder_output)
@@ -647,7 +692,6 @@ class ParallelAttention(MegatronModule):
         # [sk, b, np, hn] -> [sk, b * np, hn]
         key_layer = key_layer.view(output_size[3], output_size[0] * output_size[1], -1)
 
-        # preallocting result tensor: [b * np, sq, sk]
         matmul_result = torch.empty(
             output_size[0] * output_size[1],
             output_size[2],
@@ -684,17 +728,17 @@ class ParallelAttention(MegatronModule):
         if position_bias is None:
             if self.position_embedding_type == 'relative':
                 position_bias = self.compute_bias(real_seq_length, key_length)
+
+                # if key and values are already calculated
+                # we want only the last query position bias
+                if layer_past is not None:
+                    position_bias = position_bias[:, :, -hidden_states.size(0) :, :]
+
+                position_bias = position_bias + attention_mask
+                attention_scores += position_bias
             else:
                 pass  # HuggingFace implementation initialize position_bias to zero when not using
 
-            # if key and values are already calculated
-            # we want only the last query position bias
-            if layer_past is not None:
-                position_bias = position_bias[:, :, -hidden_states.size(0) :, :]
-
-            if self.position_embedding_type == 'relative':
-                position_bias = position_bias + attention_mask
-                attention_scores += position_bias
 
         # ===========================
         # Attention probs and dropout
@@ -790,6 +834,7 @@ class ParallelChunkedCrossAttention(MegatronModule):
         megatron_legacy=False,
         chunk_size=64,  # each chunk, how many tokens
         bias=True,
+        onnx_safe=False,
     ):
         super(ParallelChunkedCrossAttention, self).__init__()
         self.cross_attention = ParallelAttention(
@@ -811,6 +856,7 @@ class ParallelChunkedCrossAttention(MegatronModule):
             relative_attention_max_distance=relative_attention_max_distance,
             megatron_legacy=megatron_legacy,
             bias=bias,
+            onnx_safe=onnx_safe,
         )
         self.chunk_size = chunk_size
 
@@ -989,6 +1035,7 @@ class ParallelTransformerLayer_(MegatronModule):
         self.bias = bias
         self.transformer_block_type = transformer_block_type
         self.position_embedding_type = position_embedding_type
+        self.onnx_safe = onnx_safe
 
         if not bias and bias_dropout_fusion:
             raise ValueError(
@@ -1013,7 +1060,7 @@ class ParallelTransformerLayer_(MegatronModule):
         if self.layer_type != LayerType.retrieval_decoder_after_self_attn:
             # Layernorm on the input data.
             if normalization == 'layernorm':
-                self.input_layernorm = get_layer_norm(hidden_size, layernorm_epsilon, persist_layer_norm)
+                self.input_layernorm = get_layer_norm(hidden_size, layernorm_epsilon, persist_layer_norm, onnx_safe)
             else:
                 self.input_layernorm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon)
 
@@ -1038,19 +1085,18 @@ class ParallelTransformerLayer_(MegatronModule):
                 megatron_legacy=megatron_legacy,
                 bias=bias,
                 headscale=headscale,
+                onnx_safe=onnx_safe
             )
             # Normformer normalization
             if transformer_block_type == 'normformer':
                 if normalization == 'layernorm':
-                    self.post_attention_normformer_norm = get_layer_norm(
-                        hidden_size, layernorm_epsilon, persist_layer_norm
-                    )
+                    self.post_attention_normformer_norm = get_layer_norm(hidden_size, layernorm_epsilon, persist_layer_norm, onnx_safe)
                 else:
                     self.post_attention_normformer_norm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon)
 
             # Layernorm on the attention output
             if normalization == 'layernorm':
-                self.post_attention_layernorm = get_layer_norm(hidden_size, layernorm_epsilon, persist_layer_norm)
+                self.post_attention_layernorm = get_layer_norm(hidden_size, layernorm_epsilon, persist_layer_norm, onnx_safe)
             else:
                 self.post_attention_layernorm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon)
 
@@ -1079,12 +1125,13 @@ class ParallelTransformerLayer_(MegatronModule):
                 megatron_legacy=megatron_legacy,
                 bias=bias,
                 headscale=headscale,
+                onnx_safe=onnx_safe
             )
             # Normformer normalization
             if transformer_block_type == 'normformer':
                 if normalization == 'layernorm':
                     self.post_inter_attention_normformer_norm = get_layer_norm(
-                        hidden_size, layernorm_epsilon, persist_layer_norm
+                        hidden_size, layernorm_epsilon, persist_layer_norm, onnx_safe
                     )
                 else:
                     self.post_inter_attention_normformer_norm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon)
@@ -1092,7 +1139,7 @@ class ParallelTransformerLayer_(MegatronModule):
             # Layernorm on the attention output.
             if normalization == 'layernorm':
                 self.post_inter_attention_layernorm = get_layer_norm(
-                    hidden_size, layernorm_epsilon, persist_layer_norm
+                    hidden_size, layernorm_epsilon, persist_layer_norm, onnx_safe
                 )
             else:
                 self.post_inter_attention_layernorm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon)
@@ -1118,19 +1165,20 @@ class ParallelTransformerLayer_(MegatronModule):
                 megatron_legacy=megatron_legacy,
                 chunk_size=chunk_size,
                 bias=bias,
+                onnx_safe=onnx_safe
             )
             # Normformer normalization
             if transformer_block_type == 'normformer':
                 if normalization == 'layernorm':
                     self.post_inter_attention_normformer_norm = get_layer_norm(
-                        hidden_size, layernorm_epsilon, persist_layer_norm
+                        hidden_size, layernorm_epsilon, persist_layer_norm, onnx_safe
                     )
                 else:
                     self.post_inter_attention_normformer_norm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon)
             # Layernorm on the attention output.
             if normalization == 'layernorm':
                 self.post_inter_attention_layernorm = get_layer_norm(
-                    hidden_size, layernorm_epsilon, persist_layer_norm
+                    hidden_size, layernorm_epsilon, persist_layer_norm, onnx_safe
                 )
             else:
                 self.post_inter_attention_layernorm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon)
@@ -1554,7 +1602,7 @@ class ParallelTransformer(MegatronModule):
         if self.post_process:
             # Final layer norm before output.
             if normalization == 'layernorm':
-                self.final_layernorm = get_layer_norm(hidden_size, layernorm_epsilon, persist_layer_norm)
+                self.final_layernorm = get_layer_norm(hidden_size, layernorm_epsilon, persist_layer_norm, onnx_safe)
             else:
                 self.final_layernorm = MixedFusedRMSNorm(hidden_size, layernorm_epsilon)
 
