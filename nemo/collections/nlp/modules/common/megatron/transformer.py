@@ -669,12 +669,6 @@ class ParallelAttention(MegatronModule):
         if get_key_value:
             present = (key_layer, value_layer)
 
-        # ===================================
-        # Raw attention scores. [b, np, s, s]
-        # ===================================
-
-        
-
         # apply relative positional encoding (rotary embedding)
         if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
@@ -685,6 +679,10 @@ class ParallelAttention(MegatronModule):
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
+
+        # ===================================
+        # Raw attention scores. [b, np, s, s]
+        # ===================================
 
         if not self.onnx_safe:
             # [b, np, sq, sk]
@@ -770,23 +768,9 @@ class ParallelAttention(MegatronModule):
         # Context layer. [sq, b, hp]
         # =========================
 
-        # value_layer -> context layer.
-        # [sk, b, np, hn] --> [b, np, sq, hn]
-
-        # context layer shape: [b, np, sq, hn]
-        output_size = (value_layer.size(1), value_layer.size(2), query_layer.size(0), value_layer.size(3))
-
-        # change view [sk, b * np, hn]
-        value_layer = value_layer.view(value_layer.size(0), output_size[0] * output_size[1], -1)
-
-        # change view [b * np, sq, sk]
-        attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
-
-        # matmul: [b * np, sq, hn]
-        context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
-
-        # change view [b, np, sq, hn]
-        context_layer = context_layer.view(*output_size)
+        # change value view [sk, b, np, hn] --> [b, np, sk, hn]
+        # matmul: [b, np, sq, sk] * [b, np, sk, hn] = [b, np, sq, hn]
+        context_layer = torch.matmul(attention_probs, value_layer.permute(1, 2, 0, 3))
 
         if self.headscale:
             context_layer = context_layer * self.head_scale_tensor
