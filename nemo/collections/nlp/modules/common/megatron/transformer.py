@@ -673,8 +673,7 @@ class ParallelAttention(MegatronModule):
         # Raw attention scores. [b, np, s, s]
         # ===================================
 
-        # [b, np, sq, sk]
-        output_size = (query_layer.size(1), query_layer.size(2), query_layer.size(0), key_layer.size(0))
+        
 
         # apply relative positional encoding (rotary embedding)
         if rotary_pos_emb is not None:
@@ -687,30 +686,36 @@ class ParallelAttention(MegatronModule):
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
 
-        # [sq, b, np, hn] -> [sq, b * np, hn]
-        query_layer = query_layer.view(output_size[2], output_size[0] * output_size[1], -1)
-        # [sk, b, np, hn] -> [sk, b * np, hn]
-        key_layer = key_layer.view(output_size[3], output_size[0] * output_size[1], -1)
+        if not self.onnx_safe:
+            # [b, np, sq, sk]
+            output_size = (query_layer.size(1), query_layer.size(2), query_layer.size(0), key_layer.size(0))
 
-        matmul_result = torch.empty(
-            output_size[0] * output_size[1],
-            output_size[2],
-            output_size[3],
-            dtype=query_layer.dtype,
-            device=torch.cuda.current_device(),
-        )
+            # [sq, b, np, hn] -> [sq, b * np, hn]
+            query_layer = query_layer.view(output_size[2], output_size[0] * output_size[1], -1)
+            # [sk, b, np, hn] -> [sk, b * np, hn]
+            key_layer = key_layer.view(output_size[3], output_size[0] * output_size[1], -1)
 
-        # Raw attention scores. [b * np, sq, sk]
-        matmul_result = torch.baddbmm(
-            matmul_result,
-            query_layer.transpose(0, 1),  # [b * np, sq, hn]
-            key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
-            beta=0.0,
-            alpha=(1.0 / self.norm_factor),
-        )
+            matmul_result = torch.empty(
+                output_size[0] * output_size[1],
+                output_size[2],
+                output_size[3],
+                dtype=query_layer.dtype,
+                device=torch.cuda.current_device(),
+            )
 
-        # change view to [b, np, sq, sk]
-        attention_scores = matmul_result.view(*output_size)
+            # Raw attention scores. [b * np, sq, sk]
+            matmul_result = torch.baddbmm(
+                matmul_result,
+                query_layer.transpose(0, 1),  # [b * np, sq, hn]
+                key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
+                beta=0.0,
+                alpha=(1.0 / self.norm_factor),
+            )
+
+            # change view to [b, np, sq, sk]
+            attention_scores = matmul_result.view(*output_size)
+        else:
+            attention_scores = torch.matmul(query_layer.permute(1, 2, 0, 3), key_layer.permute(1, 2, 3, 0)) / self.norm_factor
 
         # ==================================================
         # Update attention mask for inference. [b, np, sq, sk]
